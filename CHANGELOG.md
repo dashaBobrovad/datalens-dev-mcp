@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.37
+
+- Recover acknowledged legacy Dataset creates and updates using the retained original Dataset identity and an exact historical ACK-revision read. Preserve unknown effects, conflicting scope, and incomplete history holds; subsequent changes still require fresh CAS.
+
 ## 1.2.36
 
 - Format JavaScript in compiled Editor recipes, new charts and supplied tabs of existing charts with two-space indentation and line wrapping.
