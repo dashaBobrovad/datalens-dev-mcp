@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.38
+
+- Add a separately authorized recovery attempt for one unknown Dataset save, bound to exact current receipt versions, provider scope, released sender leases and a fresh saved revision.
+- Preserve original unknown outcomes and single-use authorization. Repeated loss stays held; only a verified acknowledged successor permits later changes with fresh CAS. No automatic mutation retries or generic override.
+
+## 1.2.37
+
+- Recover acknowledged legacy Dataset creates and updates using the retained original Dataset identity and an exact historical ACK-revision read. Preserve unknown effects, conflicting scope, and incomplete history holds; subsequent changes still require fresh CAS.
+
 ## 1.2.36
 
 - Format JavaScript in compiled Editor recipes, new charts and supplied tabs of existing charts with two-space indentation and line wrapping.

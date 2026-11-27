@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import ExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
 from functools import wraps
@@ -22,7 +23,7 @@ from datalens_dev_mcp.authoring.artifacts import resolve_artifact
 from datalens_dev_mcp.editor.formatting import format_editor_payload
 from datalens_dev_mcp.editor.validation import TAB_FIELDS as _EDITOR_ARTIFACT_TABS
 from datalens_dev_mcp.objects.relations import object_identity
-from datalens_dev_mcp.operation_store import OperationStore, normalize_operation
+from datalens_dev_mcp.operation_store import OperationStore, normalize_operation, normalize_update_repeat_refs
 
 _EDITOR_ARTIFACT_TYPES = frozenset(
     {
@@ -94,12 +95,19 @@ def _owned_mutation(method):
     @wraps(method)
     def owned(self, *args, operation_id=None, **kwargs):
         operation_id = operation_id or str(uuid4())
-        with self.store.mutation_lease(operation_id) as acquired:
+        with ExitStack() as leases:
+            acquired = leases.enter_context(self.store.mutation_lease(operation_id))
             if not acquired:
                 # Do not expose the other request's receipt before validating its scope/digest.
                 return {"ok": False, "status": "pending", "operation_id": operation_id,
                         "owner_active": True, "write_replayed": False,
                         "next_action": "A live sender owns this operation; inspect its receipt after it returns"}
+            if kwargs.get("repeat_of") is not None:
+                refs = normalize_update_repeat_refs(kwargs["repeat_of"])
+                kwargs["repeat_of"] = refs
+                for original in sorted({r["operation_id"] for r in refs}):
+                    if original == operation_id or not leases.enter_context(self.store.mutation_lease(original)):
+                        raise DataLensSafetyError("The original sender is active; no repeat is admitted")
             return method(self, *args, operation_id=operation_id, **kwargs)
     return owned
 
@@ -265,7 +273,8 @@ class ObjectMutationService:
 
     @_owned_mutation
     def update_objects(
-        self, changes: list[dict[str, Any]], *, delivery_mode: str = "save", operation_id: str | None = None
+        self, changes: list[dict[str, Any]], *, delivery_mode: str = "save", operation_id: str | None = None,
+        repeat_of: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         if delivery_mode not in {"save", "publish"} or (delivery_mode == "publish"
                 and any(change.get("object_type") != "dataset" for change in changes)):
@@ -274,7 +283,11 @@ class ObjectMutationService:
             changes = [_resolve_update_change(change) for change in changes]
         except (ValueError, TypeError) as exc:
             raise InputContractError(safe_error_text(exc)) from exc
+        if repeat_of and (delivery_mode != "save" or len(changes) != 1
+                          or changes[0].get("object_type") != "dataset" or not changes[0].get("expected_revision")):
+            raise DataLensSafetyError("repeat_of requires one Dataset save with its fresh expected_revision")
         admitted, record = self._record("update", {"changes": changes,
+                                       **({"repeat_of": repeat_of} if repeat_of else {}),
                                        **({"delivery_mode": "publish"} if delivery_mode == "publish" else {})}, operation_id)
         if not admitted:
             return record
@@ -543,6 +556,9 @@ class ObjectMutationService:
                     new_entry = new_entry.get("entry", new_entry)
                     scope_verified = all(old_entry.get(key) and old_entry[key] == new_entry.get(key)
                                          for key in ("tenantId", "workbookId", "entryId"))
+                    if (not scope_verified and record.get("effect") in {"update", "create"}
+                            and object_type == "dataset"):
+                        scope_verified = self._legacy_dataset_scope_verified(item, current, branch=branch)
                 if item["status"] == "completed":
                     item["code"] = "reconciled_applied"
                 elif ((record.get("effect") in {"update", "publish"}
@@ -563,6 +579,49 @@ class ObjectMutationService:
         result = self._save(record)
         result["write_replayed"] = False
         return result
+
+    def _legacy_dataset_scope_verified(self, item: dict[str, Any], current: dict[str, Any], *, branch: str) -> bool:
+        """Bind a legacy Dataset ACK to its original revision without replay or a new scope anchor."""
+        # Dataset responses use id/workbook_id and omit tenantId. Never replace
+        # an existing chart-style scope anchor or infer one from a later read.
+        if any((item.get("legacy_scope_evidence") or {}).values()) or not self.provider_scope:
+            return False
+        revision = item.get("returned_revision")
+        if not item.get("write_returned") or not isinstance(revision, str) or not revision:
+            return False
+        if revision == item.get("expected_revision"):
+            return False
+        object_id = item["target"]["object_id"]
+
+        def matches(readback: dict[str, Any], workbook: str | None = None, *, legacy: bool = False) -> bool:
+            identity = readback.get("identity") or {}
+            payload = readback.get("object") or {}
+            return (_usable_full_read(readback)
+                    and identity.get("object_type") == "dataset" and identity.get("object_id") == object_id
+                    and identity.get("branch") in ({branch, "unbranched"} if legacy else {branch})
+                    and identity.get("revision_id") == revision
+                    and payload.get("id") == object_id and payload.get("revId") == revision
+                    and isinstance(payload.get("workbook_id"), str) and bool(payload["workbook_id"])
+                    and (workbook is None or payload["workbook_id"] == workbook))
+
+        original = next((state.get("readback", {}) for state in item.get("history", [])
+                         if matches(state.get("readback", {}), legacy=True)), None)
+        if original is None:
+            return False
+        workbook = original["object"]["workbook_id"]
+        current_payload = current.get("object") or {}
+        if current_payload.get("id") != object_id or current_payload.get("workbook_id") != workbook:
+            return False
+        # The exact ACK revision must still resolve in this configured provider.
+        # A current workbook/id match alone cannot establish historical scope.
+        historical = self.reader.object_get("dataset", object_id, branch=branch, revision_id=revision)
+        if not matches(historical, workbook):
+            return False
+        item["legacy_dataset_revision_evidence"] = {
+            "object_id": object_id, "workbook_id": workbook, "revision_id": revision,
+            "source": "retained_original_readback_and_exact_historical_revision",
+        }
+        return True
 
     def _investigate_create(self, item: dict[str, Any]) -> None:
         """Read bounded candidates; only a persisted per-create marker can attribute."""
@@ -845,6 +904,7 @@ class ObjectMutationService:
                     "status": "pending",
                     "sender_contract": "leased_v1",
                     "semantic_contract": "typed_v2",
+                    **({"repeat_of": deepcopy(request["repeat_of"])} if request.get("repeat_of") else {}),
                     "next_action": "Inspect the existing receipt; an active or interrupted claim must not be replayed.",
                     "results": [],
                 }

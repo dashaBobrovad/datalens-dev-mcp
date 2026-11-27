@@ -104,6 +104,17 @@ short process locks prevent concurrent reconciliation from overwriting a newer
 receipt. Reconciliation is idempotent after resolution. Unknown effects and async
 connection operations remain blocked, including attempts with a new ID.
 
+Legacy Dataset creates and updates use a different provider envelope (`id`/`workbook_id`,
+without `tenantId`). An otherwise empty legacy scope anchor can be recovered only
+when receipt history retains a complete read of the exact returned ACK revision,
+the current Dataset has the same object/workbook identity, and a fresh exact
+historical-revision read confirms that identity in the configured provider.
+The original receipt may use the legacy Dataset `unbranched` label; the fresh
+historical read must confirm the requested branch.
+An echoed precondition revision, missing ACK or original readback, a conflicting
+anchor, or an incomplete/unavailable historical read retains the hold. Recovery
+does not repeat the update or claim historical content verification.
+
 Manual input `source.fieldType` is rejected before dispatch with its exact path
 and applicable example. Only the observed legacy manual-input string field is
 normalized during comparison; required fields, parameter values, list order,

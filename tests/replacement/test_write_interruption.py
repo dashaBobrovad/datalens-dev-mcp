@@ -306,6 +306,70 @@ def test_reconcile_does_not_release_unproven_history(tmp_path, case):
     assert writer.backend.calls == []
 
 
+@pytest.mark.parametrize("case", [
+    "verified", "unknown_effect", "missing_revision", "missing_original", "wrong_current_workbook",
+    "wrong_history_workbook", "wrong_history_identity", "wrong_history_revision", "incomplete_history",
+    "unavailable_history", "conflicting_anchor", "original_unbranched", "wrong_original_branch",
+])
+@pytest.mark.parametrize("effect", ["update", "create"])
+def test_legacy_dataset_ack_requires_original_and_exact_historical_revision(tmp_path, case, effect):
+    from copy import deepcopy
+
+    original = rb("dataset", "d", "r2", {"id": "d", "workbook_id": "wb", "revId": "r2",
+                  "dataset": {"description": "Historical content"}})
+    current = deepcopy(original)
+    current["identity"]["revision_id"] = current["object"]["revId"] = "r3"
+    current["object"]["dataset"]["description"] = "Manual changes"
+    historical = deepcopy(original)
+    if case in {"original_unbranched", "wrong_original_branch"}:
+        original["identity"]["branch"] = "unbranched" if case == "original_unbranched" else "published"
+    if case == "wrong_current_workbook":
+        current["object"]["workbook_id"] = "other"
+    if case == "wrong_history_workbook":
+        historical["object"]["workbook_id"] = "other"
+    if case == "wrong_history_identity":
+        historical["identity"]["object_id"] = "other"
+    if case == "wrong_history_revision":
+        historical["identity"]["revision_id"] = "other"
+    if case == "incomplete_history":
+        historical["complete"] = False
+
+    class RevisionReader(FakeReader):
+        def object_get(self, object_type, object_id, *, branch="saved", revision_id=None):
+            if revision_id is not None:
+                assert (object_type, object_id, branch, revision_id) == ("dataset", "d", "saved", "r2")
+                if case == "unavailable_history":
+                    raise DataLensApiError("Historical revision unavailable", http_status=404)
+                return historical
+            return super().object_get(object_type, object_id, branch=branch)
+
+    writer = service(tmp_path, RevisionReader({("dataset", "d", "saved"): [current]}), FakeBackend([]))
+    writer.provider_scope = "current-provider"
+    item = {"key": "dataset:d", "status": "uncertain", "target": {"object_type": "dataset", "object_id": "d"},
+            "write_returned": case != "unknown_effect", "returned_revision": None if case == "missing_revision" else "r2",
+            "desired": {"dataset": {"description": "Old intent"}}, "readback": current,
+            "legacy_scope_evidence": {"tenantId": None, "workbookId": None, "entryId": None},
+            "history": [] if case == "missing_original" else [{"readback": original}]}
+    if case == "conflicting_anchor":
+        item["legacy_scope_evidence"]["workbookId"] = "other"
+    writer.store.put({"operation_id": "legacy-dataset", "effect": effect, "status": "uncertain",
+                      "request_digest": "historical", "results": [item]})
+    result = writer.reconcile("legacy-dataset")
+    assert result["write_replayed"] is False
+    assert writer.backend.calls == []
+    if case not in {"verified", "original_unbranched"}:
+        assert result["status"] == "uncertain", result
+        return
+    recovered = result["results"][0]
+    assert recovered["status"] == "resolved", recovered
+    assert recovered["write_verified"] is False
+    assert recovered["verification_status"] == "historical_content_unverified"
+    assert recovered["continuation_requires_fresh_cas"] is True
+    assert recovered["history"][0]["readback"] == original
+    version = writer.store.get("legacy-dataset")["store_version"]
+    assert writer.reconcile("legacy-dataset")["store_version"] == version
+
+
 @pytest.mark.parametrize("response, expected, role", [
     ({"entry": {"revId": "r2"}}, "r2", "result"), ({"rev_id": "r2"}, "r2", "result"),
     ({"entry": {"revId": "r1"}}, None, "precondition"), ({}, None, "not_returned")])
