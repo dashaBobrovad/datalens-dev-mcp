@@ -96,7 +96,15 @@ hash may differ. The receipt freezes exact expected content before dispatch.
 
 `not_dispatched` with `not_applied` describes a proven preparation failure. A confirmed provider rejection may instead be `dispatched` with `not_applied`; a missing response, failed readback or possible earlier composite effect remains unknown. Inspect both per-item and overall outcomes; never replay completed items in a partial batch. Historical unknown receipts remain unknown without new evidence.
 
-For cleanup only, the typed `repeat_of` references provide the separately authorized repeat path described in [maintenance boundaries](../../datalens-maintenance/references/boundaries.md). Keep the original unknown receipts and current versions; do not substitute a new operation ID alone. A single SDK mutation that fails during connection or pool acquisition before request bytes is `not_dispatched`/`not_applied`. A write/read timeout, lost response, or later connection failure after an earlier composite effect remains unknown. No case adds automatic mutation retries.
+For cleanup, typed `repeat_of` references provide the separately authorized repeat path described in [maintenance boundaries](../../datalens-maintenance/references/boundaries.md). Dataset saves have the bounded update path below. Keep original unknown receipts and current versions; a new operation ID alone never authorizes replay. A single SDK mutation that fails during connection or pool acquisition before request bytes is `not_dispatched`/`not_applied`. A write/read timeout, lost response, or later connection failure after an earlier composite effect remains unknown. No case adds automatic mutation retries.
+
+### Separately authorized Dataset save after an unknown save
+
+First inspect and reconcile the original operation. If it remains unknown, explain that another save may create an additional revision or overlap a delayed original effect. Obtain the user's separate informed authorization for one new attempt; a general request to fix the chart or server is not that authorization.
+
+Use `dl_object_update` with `delivery_mode="save"`, exactly one Dataset change, a full fresh saved read, its `expected_revision`, a new `operation_id`, and `repeat_of=[{operation_id, object_id, receipt_version}, ...]`. Each receipt_version is the current store_version. Reference every unresolved unknown save for that exact target and configured provider scope. The owner leases the old senders, checks versions and scope, and preserves all original unknown receipts. Creates, publishes, acknowledged writes, active senders, unscoped/legacy senders, missing CAS and stale receipt versions remain held. No generic override is exposed.
+
+One grant permits one possible new effect. Reusing the same request ID returns its receipt without another write; a different ID cannot spend the same grant again. A local preflight rejection with no dispatch does not spend it. If the new attempt is also unknown, stop: another informed authorization must cover the whole unknown chain. Only a verified acknowledged successor releases the original hold for later independent changes, all of which still require fresh explicit CAS. This does not establish whether the original save applied. Save/readback, validation, and any subsequent authorized publication remain separate obligations.
 
 ## Compact continuation
 
@@ -138,7 +146,7 @@ claim the old desired state is current or historically verified. Retained
 history preserves prior errors, intent and readback. Read the current full saved
 object, preserve manual changes, and submit an intentional narrow change with a
 fresh `expected_revision` and a new operation ID. A stale revision cannot pass.
-Unknown effects and asynchronous connection provisioning remain held. A new ID,
+Unknown effects remain held except for the separately authorized Dataset save path above. Asynchronous connection provisioning stays held. A new ID,
 empty inventory or newer revision alone never establishes the old effect.
 
 Manual parameter inputs (`sourceType=manual`, `elementType=input`) do not accept

@@ -344,10 +344,12 @@ def dl_object_create(
 
 
 def dl_object_update(
-    changes: list[dict[str, Any]], delivery_mode: str = "save", operation_id: str | None = None
+    changes: list[dict[str, Any]], delivery_mode: str = "save", operation_id: str | None = None,
+    repeat_of: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
     return compact_operation(
-        default_mutation_service().update_objects(changes, delivery_mode=delivery_mode, operation_id=operation_id)
+        default_mutation_service().update_objects(changes, delivery_mode=delivery_mode, operation_id=operation_id,
+                                                 **({"repeat_of": repeat_of} if repeat_of is not None else {}))
     )
 
 
@@ -733,11 +735,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "dl_object_update",
-        "description": "Apply narrow saved-object patches with revision checks and readback; exact no-ops do not write. For existing dashboard tabs use dashboard_patch plus expected_revision: items/globalItems keyed by id with optional namespace, group_control children via group keyed by native id, layout by i, connections by from/to, with add/update/remove and small tab metadata patches. Send only changed records, not whole tabs. Named global parameter removal uses remove_global_params. Compiled Editor updates use artifact_path. Writes retain private receipts; unknown effects are not replayed.",
+        "description": "Apply narrow saved-object patches with revision checks and readback; exact no-ops do not write. For existing dashboard tabs use dashboard_patch plus expected_revision: items/globalItems keyed by id with optional namespace, group_control children via group keyed by native id, layout by i, connections by from/to, with add/update/remove and small tab metadata patches. Send only changed records, not whole tabs. Named global parameter removal uses remove_global_params. Compiled Editor updates use artifact_path. Writes retain private receipts. repeat_of supports one separately informed, explicitly authorized Dataset save after an unknown save; never automatic replay.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "changes": {"type": "array", "minItems": 1, "items": CHANGE},
+                "repeat_of": {"type": "array", "minItems": 1, "maxItems": 1000, "uniqueItems": True,
+                              "description": "Only after separate informed user authorization for another possible effect. "
+                                             "Reference every unknown save of the one exact Dataset using current "
+                                             "store_version, a fresh expected_revision and a new operation_id. "
+                                             "Original receipts remain unknown; each grant is single-use.",
+                              "items": {"type": "object", "properties": {
+                                  "operation_id": {"type": "string", "minLength": 1},
+                                  "object_id": {"type": "string", "minLength": 1},
+                                  "receipt_version": {"type": "integer", "minimum": 1}},
+                                  "required": ["operation_id", "object_id", "receipt_version"],
+                                  "additionalProperties": False}},
                 "delivery_mode": {"type": "string", "enum": ["save", "publish"], "default": "save", "description": "publish is Dataset-only content publication and creates a new revision."},
                 "operation_id": {"type": ["string", "null"]},
             },

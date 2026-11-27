@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import ExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
 from functools import wraps
@@ -22,7 +23,7 @@ from datalens_dev_mcp.authoring.artifacts import resolve_artifact
 from datalens_dev_mcp.editor.formatting import format_editor_payload
 from datalens_dev_mcp.editor.validation import TAB_FIELDS as _EDITOR_ARTIFACT_TABS
 from datalens_dev_mcp.objects.relations import object_identity
-from datalens_dev_mcp.operation_store import OperationStore, normalize_operation
+from datalens_dev_mcp.operation_store import OperationStore, normalize_operation, normalize_update_repeat_refs
 
 _EDITOR_ARTIFACT_TYPES = frozenset(
     {
@@ -94,12 +95,19 @@ def _owned_mutation(method):
     @wraps(method)
     def owned(self, *args, operation_id=None, **kwargs):
         operation_id = operation_id or str(uuid4())
-        with self.store.mutation_lease(operation_id) as acquired:
+        with ExitStack() as leases:
+            acquired = leases.enter_context(self.store.mutation_lease(operation_id))
             if not acquired:
                 # Do not expose the other request's receipt before validating its scope/digest.
                 return {"ok": False, "status": "pending", "operation_id": operation_id,
                         "owner_active": True, "write_replayed": False,
                         "next_action": "A live sender owns this operation; inspect its receipt after it returns"}
+            if kwargs.get("repeat_of") is not None:
+                refs = normalize_update_repeat_refs(kwargs["repeat_of"])
+                kwargs["repeat_of"] = refs
+                for original in sorted({r["operation_id"] for r in refs}):
+                    if original == operation_id or not leases.enter_context(self.store.mutation_lease(original)):
+                        raise DataLensSafetyError("The original sender is active; no repeat is admitted")
             return method(self, *args, operation_id=operation_id, **kwargs)
     return owned
 
@@ -265,7 +273,8 @@ class ObjectMutationService:
 
     @_owned_mutation
     def update_objects(
-        self, changes: list[dict[str, Any]], *, delivery_mode: str = "save", operation_id: str | None = None
+        self, changes: list[dict[str, Any]], *, delivery_mode: str = "save", operation_id: str | None = None,
+        repeat_of: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         if delivery_mode not in {"save", "publish"} or (delivery_mode == "publish"
                 and any(change.get("object_type") != "dataset" for change in changes)):
@@ -274,7 +283,11 @@ class ObjectMutationService:
             changes = [_resolve_update_change(change) for change in changes]
         except (ValueError, TypeError) as exc:
             raise InputContractError(safe_error_text(exc)) from exc
+        if repeat_of and (delivery_mode != "save" or len(changes) != 1
+                          or changes[0].get("object_type") != "dataset" or not changes[0].get("expected_revision")):
+            raise DataLensSafetyError("repeat_of requires one Dataset save with its fresh expected_revision")
         admitted, record = self._record("update", {"changes": changes,
+                                       **({"repeat_of": repeat_of} if repeat_of else {}),
                                        **({"delivery_mode": "publish"} if delivery_mode == "publish" else {})}, operation_id)
         if not admitted:
             return record
@@ -891,6 +904,7 @@ class ObjectMutationService:
                     "status": "pending",
                     "sender_contract": "leased_v1",
                     "semantic_contract": "typed_v2",
+                    **({"repeat_of": deepcopy(request["repeat_of"])} if request.get("repeat_of") else {}),
                     "next_action": "Inspect the existing receipt; an active or interrupted claim must not be replayed.",
                     "results": [],
                 }

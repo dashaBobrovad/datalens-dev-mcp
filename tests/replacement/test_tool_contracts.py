@@ -138,7 +138,7 @@ def test_runtime_fingerprint_reports_active_identity_without_cwd_git(tmp_path, m
 def test_method_lookup_distinguishes_tool_input_from_provider_metadata():
     result = server.dl_method_schema("dl_object_update")
     assert result["status"] == "wrong_contract_level"
-    assert result["tool_contract"]["fields"] == ["changes", "delivery_mode", "operation_id"]
+    assert result["tool_contract"]["fields"] == ["changes", "repeat_of", "delivery_mode", "operation_id"]
     assert result["tool_contract"]["required"] == ["changes"]
     assert "available_methods" not in result
     result = server.call_tool("dl_object_diff", {"object_type": "dashboard", "object_id": "synthetic",

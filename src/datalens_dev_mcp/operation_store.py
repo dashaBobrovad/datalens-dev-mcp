@@ -27,6 +27,27 @@ def default_operation_root() -> Path:
     return root / "datalens-dev-mcp" / "operations"
 
 
+def normalize_update_repeat_refs(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not 1 <= len(value) <= 1000:
+        raise InputContractError("repeat_of must contain 1–1000 exact receipt references")
+    result = []
+    keys = set()
+    for ref in value:
+        if (not isinstance(ref, dict) or set(ref) != {"operation_id", "object_id", "receipt_version"}
+                or not isinstance(ref["operation_id"], str) or not _SAFE_ID.fullmatch(ref["operation_id"])
+                or not isinstance(ref["object_id"], str) or not ref["object_id"]
+                or type(ref["receipt_version"]) is not int or ref["receipt_version"] < 1):
+            raise InputContractError("repeat_of requires operation_id, object_id and positive integer receipt_version")
+        key = (ref["operation_id"], ref["object_id"])
+        if key in keys:
+            raise InputContractError("repeat_of contains a repeated receipt target")
+        keys.add(key)
+        result.append(deepcopy(ref))
+    return result
+
+
 class OperationStore:
     """Small durable records for modifying API calls, not a task journal."""
 
@@ -146,8 +167,10 @@ class OperationStore:
         targets = set(record.get("write_targets", []))
         targets -= {item.get("target", {}).get("object_id") for item in record.get("results", [])
                     if item.get("status") in {"completed", "resolved"}}
-        for path in self.root.glob("*.json"):
-            other = json.loads(path.read_text(encoding="utf-8"))
+        records = [json.loads(path.read_text(encoding="utf-8")) for path in self.root.glob("*.json")]
+        successors = self._verified_update_successors(records, record.get("provider_scope"))
+        authorized = self._check_update_repeat(record, records, successors) if record.get("repeat_of") else set()
+        for other in records:
             if other.get("operation_id") == record.get("operation_id") or other.get("effect") == "cleanup":
                 continue
             if (other.get("provider_scope") and record.get("provider_scope")
@@ -172,9 +195,74 @@ class OperationStore:
             known_targets = {item.get("target", {}).get("object_id") for item in items}
             if other.get("status") == "pending":
                 unknown_targets.update(set(other.get("write_targets", [])) - known_targets)
+            superseded = {oid for oid in unknown_targets if (other["operation_id"], oid) in successors}
+            if targets.intersection(superseded) - set(record.get("cas_targets", [])):
+                raise DataLensSafetyError("Continuation after an authorized update requires a fresh expected revision")
+            unknown_targets -= superseded
+            unknown_targets -= {oid for original, oid in authorized if original == other["operation_id"]}
+            if authorized or superseded:
+                same_intent = same_intent and bool(unknown_targets)
             if same_intent or targets.intersection(unknown_targets):
                 raise DataLensSafetyError("An earlier mutation has an unresolved intent or target; reconcile operation_id "
                                           + other["operation_id"] + "; a new ID does not authorize replay")
+
+    @staticmethod
+    def _verified_update_successors(records: list[dict[str, Any]], scope: str | None) -> set[tuple[str, str]]:
+        """Keep unknowns; only a verified, explicitly authorized successor releases their hold."""
+        result = set()
+        for record in records:
+            if (not scope or record.get("provider_scope") != scope or record.get("effect") != "update"
+                    or record.get("semantic_contract") != "typed_v2"):
+                continue
+            for item in record.get("results", []):
+                target = item.get("target", {})
+                if (target.get("object_type") != "dataset" or item.get("status") != "completed"
+                        or item.get("write_returned") is not True or item.get("write_verified") is not True
+                        or item.get("effect_outcome") != "applied" or not item.get("observed_revision")):
+                    continue
+                for ref in record.get("repeat_of", []):
+                    if ref["object_id"] == target.get("object_id"):
+                        result.add((ref["operation_id"], ref["object_id"]))
+        return result
+
+    def _check_update_repeat(self, record: dict[str, Any], records: list[dict[str, Any]],
+                             successors: set[tuple[str, str]]) -> set[tuple[str, str]]:
+        refs = {(r["operation_id"], r["object_id"]): r for r in normalize_update_repeat_refs(record["repeat_of"])}
+        targets = set(record.get("write_targets", []))
+        scope = record.get("provider_scope")
+        if (record.get("effect") != "update" or not scope or len(targets) != 1
+                or targets - set(record.get("cas_targets", []))):
+            raise DataLensSafetyError("Authorized Dataset repeat requires one target and its fresh expected revision")
+        required = {}
+        for other in records:
+            if other["operation_id"] == record["operation_id"] or other.get("provider_scope") != scope:
+                continue
+            for previous in other.get("repeat_of", []):
+                key = (previous["operation_id"], previous["object_id"])
+                if (key in refs and (other["operation_id"], previous["object_id"]) not in refs
+                        and (other.get("status") == "pending" or any(
+                            item.get("target", {}).get("object_id") == previous["object_id"]
+                            and (item.get("dispatch_state") == "dispatched" or item.get("write_returned")
+                                 or item.get("effect_outcome") in {"applied", "unknown"})
+                            for item in other.get("results", [])))):
+                    raise DataLensSafetyError("Repeat authorization was already used; inspect its successor operation")
+            for item in other.get("results", []):
+                target = item.get("target", {})
+                key = (other["operation_id"], target.get("object_id"))
+                if target.get("object_id") not in targets or item.get("status") != "uncertain" or key in successors:
+                    continue
+                if (other.get("effect") != "update" or other.get("status") == "pending"
+                        or other.get("sender_contract") != "leased_v1" or other.get("semantic_contract") != "typed_v2"
+                        or target.get("object_type") != "dataset" or item.get("effect_outcome") != "unknown"
+                        or item.get("write_returned") or item.get("delivery_mode", "save") != "save"):
+                    raise DataLensSafetyError("Only an idle unknown Dataset save supports an authorized repeat")
+                required[key] = other
+        if refs.keys() != required.keys():
+            raise DataLensSafetyError("repeat_of must match every unresolved Dataset save for the exact target and scope")
+        for key, ref in refs.items():
+            if required[key].get("store_version") != ref["receipt_version"]:
+                raise DataLensSafetyError("Original receipt version changed; inspect it before another effect")
+        return set(refs)
 
     def _check_cleanup_claim(self, record: dict[str, Any]) -> None:
         """Called under the store lock; an explicit grant never clears old evidence."""
